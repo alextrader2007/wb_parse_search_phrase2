@@ -57,6 +57,9 @@ DEFAULT_HEADERS = {
 # Cache for x_wbaas_token to avoid fetching it for every product
 _WBAAS_TOKEN = None
 
+# Global session for keep-alive
+_SESSION = requests.Session()
+_SESSION.headers.update(DEFAULT_HEADERS)
 
 _VOL_BASKET_CACHE = {}
 _BASKET_EXECUTOR = None
@@ -74,7 +77,7 @@ def get_basket_dynamically(vol: int, part: int, sku: int) -> str:
     from concurrent.futures import ThreadPoolExecutor, as_completed
     global _BASKET_EXECUTOR
     if _BASKET_EXECUTOR is None:
-        _BASKET_EXECUTOR = ThreadPoolExecutor(max_workers=100)
+        _BASKET_EXECUTOR = ThreadPoolExecutor(max_workers=15)
     
     # Static fallback
     if vol <= 143: guess = "01"
@@ -131,12 +134,17 @@ def make_request(url: str, params: Optional[Dict[str, Any]] = None, headers: Opt
     """
     Makes an HTTP request with automatic handling of 429 (Too Many Requests)
     using exponential backoff and the Retry-After header.
+    Uses global session for keep-alive connections.
     """
     delay = 3.0
     for attempt in range(max_retries):
         try:
-            proxy = {'http': random.choice(proxies), 'https': random.choice(proxies)} if proxies else None
-            response = requests.get(url, params=params, headers=headers, cookies=cookies, proxies=proxy, timeout=timeout)
+            if proxies:
+                selected = random.choice(proxies)
+                proxy = {'http': selected, 'https': selected}
+            else:
+                proxy = None
+            response = _SESSION.get(url, params=params, headers=headers, cookies=cookies, proxies=proxy, timeout=timeout)
             
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
@@ -702,6 +710,38 @@ def fetch_product_details(nm_id: int, proxies: Optional[List[str]] = None) -> Di
 
 
 
+def fetch_all_details_parallel(products: List[Dict[str, Any]], proxies: Optional[List[str]] = None, max_workers: int = 10) -> Dict[int, Dict]:
+    """Fetches product details (description, characteristics) in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    details_map = {}
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task("[cyan]Загрузка характеристик...", total=len(products))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(fetch_product_details, p.get('Артикул'), proxies): p
+                for p in products if p.get('Артикул')
+            }
+            for future in as_completed(futures):
+                p = futures[future]
+                nm_id = p.get('Артикул')
+                try:
+                    details_map[nm_id] = future.result()
+                except Exception:
+                    details_map[nm_id] = {'description': '', 'characteristics': []}
+                progress.advance(task)
+
+    return details_map
+
+
 def export_data(
     products: List[Dict[str, Any]],
     base_filename: str,
@@ -716,105 +756,95 @@ def export_data(
     if not products:
         console.print("[yellow]Экспорт отменен: нет данных для сохранения.[/yellow]")
         return
-        
+
     df = pd.DataFrame(products)
-    
+
     excel_file = f"{base_filename}.xlsx"
     csv_file = f"{base_filename}.csv"
-    
-    # Save to Excel
+
+    # Pre-fetch details in parallel if needed
+    details_map = {}
+    if include_details:
+        console.print(f"\n[cyan]Загрузка характеристик и описания для {len(products)} товаров...[/cyan]")
+        details_map = fetch_all_details_parallel(products, proxies)
+
     try:
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
-            # Main sheet with all products
             df.to_excel(writer, sheet_name='Товары', index=False)
-            
+
             if include_details:
-                console.print(f"\n[cyan]Загрузка характеристик и описания для {len(products)} товаров...[/cyan]")
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                    TimeRemainingColumn(),
-                    console=console
-                ) as progress:
-                    detail_task = progress.add_task("[cyan]Получение характеристик...", total=len(products))
-                    
-                    for idx, prod in enumerate(products, start=1):
-                        nm_id = prod.get('Артикул')
-                        sheet_name = str(idx)  # Sheet named 1, 2, 3...
-                        
-                        details = fetch_product_details(nm_id, proxies) if nm_id else {'description': '', 'characteristics': []}
-                        
-                        # Build sheet content
-                        rows = []
-                        # Header info
-                        rows.append({'Поле': 'Артикул', 'Значение': str(nm_id or '')})
-                        rows.append({'Поле': 'Название', 'Значение': str(prod.get('Название', ''))})
-                        rows.append({'Поле': 'Бренд', 'Значение': str(prod.get('Бренд', ''))})
-                        rows.append({'Поле': 'Продавец', 'Значение': str(prod.get('Продавец', ''))})
-                        rows.append({'Поле': 'Ссылка', 'Значение': str(prod.get('Ссылка на товар', ''))})
-                        rows.append({'Поле': '', 'Значение': ''})  # empty separator
-                        rows.append({'Поле': 'ОПИСАНИЕ', 'Значение': details['description']})
-                        rows.append({'Поле': '', 'Значение': ''})  # empty separator
-                        
-                        # Characteristics
-                        if details['characteristics']:
-                            rows.append({'Поле': '--- ХАРАКТЕРИСТИКИ ---', 'Значение': ''})
-                            for char in details['characteristics']:
-                                rows.append({
-                                    'Поле': char.get('Характеристика', ''),
-                                    'Значение': char.get('Значение', '')
-                                })
-                        else:
-                            rows.append({'Поле': 'Характеристики', 'Значение': 'Не найдены'})
-                        
-                        sheet_df = pd.DataFrame(rows)
-                        sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                        
-                        # Download and insert image
-                        if nm_id:
-                            vol = nm_id // 100000
-                            part = nm_id // 1000
-                            basket = get_basket_dynamically(vol, part, nm_id)
-                            image_url = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
-                        else:
-                            image_url = prod.get('Ссылка на изображение')
-                            
-                        if image_url:
-                            try:
-                                import io
-                                import requests
-                                from openpyxl.drawing.image import Image as OpenpyxlImage
-                                
-                                img_resp = requests.get(image_url, timeout=5)
-                                if img_resp.status_code == 200:
-                                    img_data = io.BytesIO(img_resp.content)
-                                    img = OpenpyxlImage(img_data)
-                                    
-                                    # Resize image to a reasonable size
-                                    max_height = 300
-                                    if img.height > max_height:
-                                        ratio = max_height / img.height
-                                        img.height = max_height
-                                        img.width = int(img.width * ratio)
-                                        
-                                    # Insert at the bottom (2 rows below the end of data)
-                                    ws = writer.sheets[sheet_name]
-                                    insert_row = len(rows) + 3
-                                    ws.add_image(img, f'A{insert_row}')
-                            except Exception:
-                                pass
-                                
-                        progress.advance(detail_task)
-                        
+                for idx, prod in enumerate(products, start=1):
+                    nm_id = prod.get('Артикул')
+                    sheet_name = str(idx)
+
+                    details = details_map.get(nm_id, {'description': '', 'characteristics': []})
+
+                    rows = []
+                    rows.append({'Поле': 'Артикул', 'Значение': str(nm_id or '')})
+                    rows.append({'Поле': 'Название', 'Значение': str(prod.get('Название', ''))})
+                    rows.append({'Поле': 'Бренд', 'Значение': str(prod.get('Бренд', ''))})
+                    rows.append({'Поле': 'Продавец', 'Значение': str(prod.get('Продавец', ''))})
+                    rows.append({'Поле': 'Ссылка', 'Значение': str(prod.get('Ссылка на товар', ''))})
+                    rows.append({'Поле': '', 'Значение': ''})
+                    rows.append({'Поле': 'ОПИСАНИЕ', 'Значение': details['description']})
+                    rows.append({'Поле': '', 'Значение': ''})
+
+                    if details['characteristics']:
+                        rows.append({'Поле': '--- ХАРАКТЕРИСТИКИ ---', 'Значение': ''})
+                        for char in details['characteristics']:
+                            rows.append({
+                                'Поле': char.get('Характеристика', ''),
+                                'Значение': char.get('Значение', '')
+                            })
+                    else:
+                        rows.append({'Поле': 'Характеристики', 'Значение': 'Не найдены'})
+
+                    sheet_df = pd.DataFrame(rows)
+                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                    if nm_id:
+                        vol = nm_id // 100000
+                        part = nm_id // 1000
+                        basket = get_basket_dynamically(vol, part, nm_id)
+                        image_url = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
+                    else:
+                        image_url = prod.get('Ссылка на изображение')
+
+                    if image_url:
+                        try:
+                            import io
+                            from openpyxl.drawing.image import Image as OpenpyxlImage
+
+                            img_resp = _SESSION.get(image_url, timeout=5)
+                            if img_resp.status_code == 200:
+                                img_data = io.BytesIO(img_resp.content)
+                                img = OpenpyxlImage(img_data)
+
+                                max_height = 300
+                                if img.height > max_height:
+                                    ratio = max_height / img.height
+                                    img.height = max_height
+                                    img.width = int(img.width * ratio)
+
+                                ws = writer.sheets[sheet_name]
+                                insert_row = len(rows) + 3
+                                ws.add_image(img, f'A{insert_row}')
+                        except Exception:
+                            pass
+
         console.print(f"[green]✔ Данные успешно экспортированы в Excel: {excel_file}[/green]")
         if include_details:
             console.print(f"[green]  Дополнительно: создано {len(products)} листов с характеристиками (листы 1–{len(products)}).[/green]")
     except Exception as e:
-        console.print(f"[red]Ошибка при записи Excel-файла: {e}[/red]")
-        
-    # Save to CSV
+        console.print(f"[red]Критическая ошибка при экспорте: {e}[/red]")
+        emergency_file = f"{base_filename}_emergency.csv"
+        try:
+            df.to_csv(emergency_file, index=False, encoding='utf-8-sig')
+            console.print(f"[yellow]⚠ Аварийное сохранение: {emergency_file} ({len(products)} товаров)[/yellow]")
+        except Exception:
+            console.print("[red]✘ Не удалось выполнить аварийное сохранение.[/red]")
+        raise
+
     try:
         df.to_csv(csv_file, index=False, encoding='utf-8-sig')
         console.print(f"[green]✔ Данные успешно экспортированы в CSV: {csv_file}[/green]")
