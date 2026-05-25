@@ -8,8 +8,9 @@
   1) Получать информацию по списку артикулов (SKU): цены, остатки, склады
   2) Искать товары по ключевому слову и определять их позицию в выдаче
   3) Работать через прокси (чтобы не заблокировали)
-  4) Сохранять результат в Excel (.xlsx) и CSV
-  5) Выгружать характеристики и описание каждого товара
+  4) Сохранять результат в Excel (.xlsx) с авто-фильтром, авто-шириной колонок и картинками
+  5) Выгружать характеристики и описание каждого товара на отдельные листы
+  6) Опционально сохранять CSV (по запросу пользователя)
 
 Как устроен парсер (для новичков):
   - Весь код — это последовательность функций: одна вызывает другую
@@ -23,6 +24,16 @@
   - Парсер получает токен через SeleniumBase (настоящий браузер Chrome)
   - Если SeleniumBase не установлен — пробует curl_cffi, затем обычный HTTP
   - Токен живёт ~неделю, кэшируется в переменной _WBAAS_TOKEN на время сеанса
+
+Особенности сборки .exe (PyInstaller):
+  - Драйвер Chrome сохраняется в %LOCALAPPDATA%\WBParser\drivers (не в temp)
+  - Pillow включается через --collect-all PIL (нужен для вставки изображений в Excel)
+  - После завершения программа ждёт Enter перед закрытием окна
+
+Известные ограничения:
+  - totalQuantity: 39 — заглушка WB для «в наличии, точное количество скрыто».
+    Парсер игнорирует эту заглушку и показывает только сумму stocks[].qty.
+  - Если Московский запрос (dest=-1257786) падает с 429, остатки могут быть 0.
 """
 
 import sys
@@ -103,6 +114,28 @@ _VOL_BASKET_CACHE = {}   # Кэш для корзин изображений —
 _BASKET_EXECUTOR = None  # Пул потоков для параллельной проверки корзин
 
 # ───────────────────────────────────────────────────────────────────────────
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: статическое определение корзины (basket) по vol
+# ───────────────────────────────────────────────────────────────────────────
+
+def _get_basket_static(vol: int) -> str:
+    if vol <= 143: return "01"
+    elif vol <= 287: return "02"
+    elif vol <= 431: return "03"
+    elif vol <= 719: return "04"
+    elif vol <= 1007: return "05"
+    elif vol <= 1061: return "06"
+    elif vol <= 1115: return "07"
+    elif vol <= 1169: return "08"
+    elif vol <= 1313: return "09"
+    elif vol <= 1601: return "10"
+    elif vol <= 1655: return "11"
+    elif vol <= 1919: return "12"
+    elif vol <= 2045: return "13"
+    elif vol <= 2189: return "14"
+    elif vol <= 2405: return "15"
+    return f"{(16 + (vol - 2406) // 216):02d}"
+
+# ───────────────────────────────────────────────────────────────────────────
 # ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: определение корзины (basket) для изображений
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -133,37 +166,20 @@ def get_basket_dynamically(vol: int, part: int, sku: int) -> str:
     if vol in _VOL_BASKET_CACHE:
         return _VOL_BASKET_CACHE[vol]
 
-    import requests
     from concurrent.futures import ThreadPoolExecutor, as_completed
     global _BASKET_EXECUTOR
     if _BASKET_EXECUTOR is None:
         _BASKET_EXECUTOR = ThreadPoolExecutor(max_workers=15)
 
     # ── Шаг 1: статическая эвристика (по старым правилам WB) ──
-    if vol <= 143: guess = "01"
-    elif vol <= 287: guess = "02"
-    elif vol <= 431: guess = "03"
-    elif vol <= 719: guess = "04"
-    elif vol <= 1007: guess = "05"
-    elif vol <= 1061: guess = "06"
-    elif vol <= 1115: guess = "07"
-    elif vol <= 1169: guess = "08"
-    elif vol <= 1313: guess = "09"
-    elif vol <= 1601: guess = "10"
-    elif vol <= 1655: guess = "11"
-    elif vol <= 1919: guess = "12"
-    elif vol <= 2045: guess = "13"
-    elif vol <= 2189: guess = "14"
-    elif vol <= 2405: guess = "15"
-    else: guess = f"{(16 + (vol - 2406) // 216):02d}"
+    guess = _get_basket_static(vol)
 
     def check_image(b_id_str):
-        """Проверяет, существует ли изображение товара в указанной корзине."""
         url = f"https://basket-{b_id_str}.wbbasket.ru/vol{vol}/part{part}/{sku}/images/big/1.webp"
         try:
-            if requests.head(url, timeout=1.5).status_code == 200:
+            if _SESSION.head(url, timeout=1.5).status_code == 200:
                 return b_id_str
-        except:
+        except Exception:
             pass
         return None
 
@@ -375,7 +391,7 @@ def parse_single_product(product: Dict[str, Any],
     # totalQuantity — это общее количество товара на ВСЕХ складах.
     # Оно может быть больше, чем сумма по размерам (если какие-то размеры не попали в ответ).
     total_quantity = product.get('totalQuantity')
-    if total_quantity is not None and total_quantity > total_stock:
+    if total_quantity is not None and total_quantity not in (39, 0) and total_quantity > total_stock:
         total_stock = total_quantity
 
     # Группируем остатки по складам (суммируем все размеры в рамках одного склада)
@@ -389,27 +405,9 @@ def parse_single_product(product: Dict[str, Any],
     # ── Ссылка на изображение ──
     image_url = ""
     if product_id:
-        def get_basket_static(v: int) -> str:
-            if v <= 143: return "01"
-            elif v <= 287: return "02"
-            elif v <= 431: return "03"
-            elif v <= 719: return "04"
-            elif v <= 1007: return "05"
-            elif v <= 1061: return "06"
-            elif v <= 1115: return "07"
-            elif v <= 1169: return "08"
-            elif v <= 1313: return "09"
-            elif v <= 1601: return "10"
-            elif v <= 1655: return "11"
-            elif v <= 1919: return "12"
-            elif v <= 2045: return "13"
-            elif v <= 2189: return "14"
-            elif v <= 2405: return "15"
-            return f"{(16 + (v - 2406) // 216):02d}"
-
         vol = product_id // 100000
         part = product_id // 1000
-        basket = get_basket_static(vol)
+        basket = _VOL_BASKET_CACHE.get(vol) or _get_basket_static(vol)
         image_url = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{product_id}/images/big/1.webp"
 
     # ── Сборка результата ──
@@ -478,7 +476,7 @@ def _fetch_wallet_discount() -> Decimal:
 
     url = "https://static-basket-01.wbbasket.ru/vol1/global-payment/default-payment.json"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = _SESSION.get(url, timeout=10)
         resp.raise_for_status()
         payload = resp.json()
     except Exception:
@@ -509,7 +507,7 @@ def _fetch_wallet_max_price() -> Decimal:
 
     url = "https://static-basket-01.wbbasket.ru/vol0/data/settings-front.json"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = _SESSION.get(url, timeout=10)
         resp.raise_for_status()
         settings = resp.json().get("variables", {})
     except Exception:
@@ -547,6 +545,30 @@ def calc_price_with_wallet(price: float) -> float:
 # ОСНОВНАЯ ФУНКЦИЯ СБОРА: получение информации по списку артикулов
 # ═══════════════════════════════════════════════════════════════════════════
 
+_DETAIL_MIRRORS = [
+    "https://card.wb.ru/cards/v4/detail",
+    "https://cards.wb.ru/cards/v4/detail",
+    "https://card.wb.ru/cards/v5/detail",
+    "https://cards.wb.ru/cards/v5/detail",
+]
+
+
+def _fetch_detail_batch(params: Dict[str, str], proxies: Optional[List[str]] = None, timeout: int = 15) -> Optional[Dict]:
+    """
+    Пытается выполнить запрос к API деталей товара, перебирая зеркала (mirrors).
+    Если одно зеркало недоступно/ошибка — пробует следующее.
+    """
+    for url in _DETAIL_MIRRORS:
+        try:
+            response = make_request(url, params=params, headers=DEFAULT_HEADERS, proxies=proxies, timeout=timeout)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('products') or data.get('data', {}).get('products'):
+                    return data
+        except Exception:
+            continue
+    return None
+
 def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
                            proxies: Optional[List[str]] = None,
                            search_meta: Optional[Dict[int, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -565,6 +587,10 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
       - WB для регионов Беларуси отдаёт только "ближайший склад" в stocks[]
       - Для Москвы отдаёт все склады. Берём цены из BYN, остатки — из MOSCOW.
 
+    Важно: totalQuantity: 39 — заглушка WB, парсер её игнорирует.
+           Если Московский запрос упал с 429, stocks[] остаются пустыми,
+           и total_stock = 0 (честно), а не 39 (ложь).
+
     Args:
         skus: список артикулов (int)
         warehouse_map: словарь складов {ID: имя}
@@ -575,7 +601,6 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
         список словарей с информацией о товарах
     """
     parsed_products = []
-    url = "https://card.wb.ru/cards/v4/detail"
 
     # API WB принимает максимум 100 артикулов за один запрос
     batch_size = 100
@@ -605,15 +630,13 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
 
             try:
                 time.sleep(random.uniform(0.5, 1.5))  # пауза, чтобы не заблокировали
-                response = make_request(url, params=params, headers=DEFAULT_HEADERS,
-                                        proxies=proxies, timeout=15)
-                data = response.json()
-                products_list = data.get('products') or data.get('data', {}).get('products', [])
+                data = _fetch_detail_batch(params, proxies=proxies, timeout=15)
+                products_list = (data or {}).get('products') or (data or {}).get('data', {}).get('products', [])
 
                 # ── Запрос 2: Moscow (RUB) → остатки по складам ──
                 msk_prods_by_id = {}
                 try:
-                    time.sleep(random.uniform(0.3, 0.8))
+                    time.sleep(random.uniform(1.0, 2.0))
                     msk_params = {
                         'appType': '1',
                         'curr': 'rub',
@@ -621,10 +644,8 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
                         'spp': '30',
                         'nm': nm_param
                     }
-                    msk_response = make_request(url, params=msk_params, headers=DEFAULT_HEADERS,
-                                                 proxies=proxies, timeout=15)
-                    msk_data = msk_response.json()
-                    msk_products = msk_data.get('products') or msk_data.get('data', {}).get('products', [])
+                    msk_data = _fetch_detail_batch(msk_params, proxies=proxies, timeout=15)
+                    msk_products = (msk_data or {}).get('products') or (msk_data or {}).get('data', {}).get('products', [])
                     for msk_prod in msk_products:
                         pid = msk_prod.get('id')
                         if pid:
@@ -642,11 +663,15 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
                         gro_sizes = prod.get('sizes', [])
                         if msk_sizes:
                             if gro_sizes:
-                                # Для каждого размера копируем stocks из московского ответа
-                                for gi in range(min(len(gro_sizes), len(msk_sizes))):
-                                    msk_stocks = msk_sizes[gi].get('stocks', [])
-                                    if msk_stocks:
-                                        gro_sizes[gi]['stocks'] = msk_stocks
+                                msk_stocks_by_name = {}
+                                for m_size in msk_sizes:
+                                    name = m_size.get('origName') or m_size.get('name')
+                                    if name:
+                                        msk_stocks_by_name[name] = m_size.get('stocks', [])
+                                for g_size in gro_sizes:
+                                    name = g_size.get('origName') or g_size.get('name')
+                                    if name in msk_stocks_by_name:
+                                        g_size['stocks'] = msk_stocks_by_name[name]
                             else:
                                 prod['sizes'] = msk_sizes
                         # Сохраняем время доставки по Москве
@@ -701,18 +726,18 @@ def get_wbaas_token(proxies: Optional[List[str]] = None) -> Optional[str]:
 
     # ── Метод 1: SeleniumBase (реальный браузер Chrome) ──
     def _seleniumbase() -> Optional[str]:
-        # Проверяем, есть ли установленный драйвер uc_driver
-        driver_path = os.path.join(os.path.dirname(__file__), '.venv', 'Lib',
-                                    'site-packages', 'seleniumbase', 'drivers', 'uc_driver.exe')
         try:
             from seleniumbase import Driver
         except Exception:
             return None
-        if not os.path.isfile(driver_path):
-            return None
 
         try:
-            # Если есть прокси — используем случайный
+            from seleniumbase import config as sb_config
+            driver_dir = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')),
+                                      'WBParser', 'drivers')
+            os.makedirs(driver_dir, exist_ok=True)
+            sb_config.settings.NEW_DRIVER_DIR = driver_dir
+
             proxy_str = None
             if proxies:
                 raw_proxy = random.choice(proxies)
@@ -1133,36 +1158,36 @@ def fetch_product_details(nm_id: int, proxies: Optional[List[str]] = None) -> Di
         'nm': str(nm_id)
     }
 
-    for fallback_url in ["https://card.wb.ru/cards/v5/detail",
-                          "https://card.wb.ru/cards/v4/detail"]:
-        try:
-            time.sleep(random.uniform(0.3, 0.8))
-            response = make_request(fallback_url, params=params, headers=DEFAULT_HEADERS,
-                                     proxies=proxies, timeout=15, cookies=token_cookies)
-            if response.status_code == 200:
-                data = response.json()
-                products_list = data.get('data', {}).get('products', []) or data.get('products', [])
-                if products_list:
-                    product = products_list[0]
-                    description = product.get('description', '') or ''
-                    raw_chars = product.get('options', []) or product.get('characteristics', []) or []
-                    characteristics = []
-                    for item in raw_chars:
-                        name = item.get('name', '')
-                        value = item.get('value', '')
-                        if name:
-                            characteristics.append({'Характеристика': name, 'Значение': str(value)})
-                    for group in product.get('grouped_options', []) or []:
-                        group_name = group.get('name', '')
-                        for opt in group.get('options', []):
-                            opt_name = opt.get('name', '')
-                            opt_value = opt.get('value', '')
-                            char_name = f"{group_name} / {opt_name}" if group_name else opt_name
-                            if opt_name:
-                                characteristics.append({'Характеристика': char_name, 'Значение': str(opt_value)})
-                    return {'description': description, 'characteristics': characteristics}
-        except Exception:
-            continue
+    for mirror_url in _DETAIL_MIRRORS:
+        if "v4/detail" in mirror_url or "v5/detail" in mirror_url:
+            try:
+                time.sleep(random.uniform(0.3, 0.8))
+                response = make_request(mirror_url, params=params, headers=DEFAULT_HEADERS,
+                                         proxies=proxies, timeout=15, cookies=token_cookies)
+                if response.status_code == 200:
+                    data = response.json()
+                    products_list = data.get('data', {}).get('products', []) or data.get('products', [])
+                    if products_list:
+                        product = products_list[0]
+                        description = product.get('description', '') or ''
+                        raw_chars = product.get('options', []) or product.get('characteristics', []) or []
+                        characteristics = []
+                        for item in raw_chars:
+                            name = item.get('name', '')
+                            value = item.get('value', '')
+                            if name:
+                                characteristics.append({'Характеристика': name, 'Значение': str(value)})
+                        for group in product.get('grouped_options', []) or []:
+                            group_name = group.get('name', '')
+                            for opt in group.get('options', []):
+                                opt_name = opt.get('name', '')
+                                opt_value = opt.get('value', '')
+                                char_name = f"{group_name} / {opt_name}" if group_name else opt_name
+                                if opt_name:
+                                    characteristics.append({'Характеристика': char_name, 'Значение': str(opt_value)})
+                        return {'description': description, 'characteristics': characteristics}
+            except Exception:
+                continue
 
     console.print(f"[yellow]  Предупреждение: Не удалось получить детали товара {nm_id} "
                    f"(все попытки провалились).[/yellow]")
@@ -1226,10 +1251,11 @@ def export_data(
     products: List[Dict[str, Any]],
     base_filename: str,
     include_details: bool = False,
-    proxies: Optional[List[str]] = None
+    proxies: Optional[List[str]] = None,
+    save_csv: bool = False
 ) -> None:
     """
-    Сохраняет результаты в файлы Excel (.xlsx) и CSV.
+    Сохраняет результаты в файлы Excel (.xlsx) и опционально CSV.
 
     Если include_details=True:
       - В Excel создаётся лист "Товары" с основной таблицей
@@ -1239,13 +1265,12 @@ def export_data(
         * характеристиками
         * фотографией товара (вставлена в лист)
 
-    При критической ошибке сохраняет *_emergency.csv (аварийно).
-
     Args:
         products: список словарей с данными
         base_filename: базовое имя файла (без расширения)
         include_details: загружать ли характеристики/описание
         proxies: список прокси
+        save_csv: сохранять ли также CSV-файл
     """
     if not products:
         console.print("[yellow]Экспорт отменен: нет данных для сохранения.[/yellow]")
@@ -1265,6 +1290,16 @@ def export_data(
     try:
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Товары', index=False)
+
+            ws = writer.sheets['Товары']
+            ws.auto_filter.ref = ws.dimensions
+            for col_cells in ws.columns:
+                max_len = 0
+                col_letter = col_cells[0].column_letter
+                for cell in col_cells:
+                    val = str(cell.value or '')
+                    max_len = max(max_len, len(val))
+                ws.column_dimensions[col_letter].width = min(max_len + 3, 60)
 
             if include_details:
                 for idx, prod in enumerate(products, start=1):
@@ -1296,6 +1331,14 @@ def export_data(
 
                     sheet_df = pd.DataFrame(rows)
                     sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    detail_ws = writer.sheets[sheet_name]
+                    for col_cells in detail_ws.columns:
+                        max_len = 0
+                        col_letter = col_cells[0].column_letter
+                        for cell in col_cells:
+                            val = str(cell.value or '')
+                            max_len = max(max_len, len(val))
+                        detail_ws.column_dimensions[col_letter].width = min(max_len + 3, 80)
 
                     # Вставляем фото товара (если удалось загрузить)
                     if nm_id:
@@ -1326,7 +1369,7 @@ def export_data(
                                 ws = writer.sheets[sheet_name]
                                 insert_row = len(rows) + 3
                                 ws.add_image(img, f'A{insert_row}')
-                        except Exception:
+                        except Exception as img_err:
                             pass
 
         console.print(f"[green]✔ Данные успешно экспортированы в Excel: {excel_file}[/green]")
@@ -1346,12 +1389,13 @@ def export_data(
             console.print("[red]✘ Не удалось выполнить аварийное сохранение.[/red]")
         raise
 
-    # Сохраняем CSV (всегда, даже если Excel уже сохранён)
-    try:
-        df.to_csv(csv_file, index=False, encoding='utf-8-sig')
-        console.print(f"[green]✔ Данные успешно экспортированы в CSV: {csv_file}[/green]")
-    except Exception as e:
-        console.print(f"[red]Ошибка при записи CSV-файла: {e}[/red]")
+    # Сохраняем CSV (опционально)
+    if save_csv:
+        try:
+            df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+            console.print(f"[green]✔ Данные успешно экспортированы в CSV: {csv_file}[/green]")
+        except Exception as e:
+            console.print(f"[red]Ошибка при записи CSV-файла: {e}[/red]")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1507,6 +1551,8 @@ def main():
         )
         include_details = (details_choice == "1")
 
+        save_csv = Confirm.ask("Сохранить также CSV-файл?", default=False)
+
         # Уточняем имя файла
         output_name = args.output
         if not args.output or args.output == "wb_results":
@@ -1515,7 +1561,7 @@ def main():
                 default="wb_results"
             )
 
-        export_data(products_data, output_name, include_details=include_details, proxies=proxies)
+        export_data(products_data, output_name, include_details=include_details, proxies=proxies, save_csv=save_csv)
 
         extra_sheets_msg = (
             f"\n - [cyan]{output_name}.xlsx[/cyan] содержит листы 1–{len(products_data)} "
@@ -1544,4 +1590,5 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         console.print("\n[yellow]Работа парсера прервана пользователем.[/yellow]")
-        sys.exit(0)
+    finally:
+        input("\nНажмите Enter для выхода...")
