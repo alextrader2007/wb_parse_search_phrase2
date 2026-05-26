@@ -668,11 +668,26 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
             try:
                 time.sleep(random.uniform(0.5, 1.5))
 
-                # ── Параллельные запросы ко всем регионам ──
-                region_results = {}  # dest -> products
-                with ThreadPoolExecutor(max_workers=len(_DETAIL_DESTS)) as executor:
+                # ── Шаг 1: запрашиваем PRIMARY_DEST отдельно (цены в BYN) ──
+                primary_curr = _DEST_CURRENCIES.get(_PRIMARY_DEST, DEFAULT_CURR)
+                primary_products = _fetch_region(nm_param, _PRIMARY_DEST, primary_curr)[1]
+
+                # Если PRIMARY_DEST не ответил — пробуем ещё раз (с паузой)
+                if not primary_products:
+                    time.sleep(random.uniform(1.0, 2.0))
+                    primary_products = _fetch_region(nm_param, _PRIMARY_DEST, primary_curr)[1]
+
+                if not primary_products:
+                    console.print("[yellow]⚠ PRIMARY_DEST не ответил, пропускаем батч.[/yellow]")
+                    progress.advance(task)
+                    continue
+
+                # ── Шаг 2: параллельные запросы к ОСТАЛЬНЫМ регионам (только stocks) ──
+                other_dests = [d for d in _DETAIL_DESTS if d != _PRIMARY_DEST]
+                region_results = {_PRIMARY_DEST: primary_products}
+                with ThreadPoolExecutor(max_workers=len(other_dests)) as executor:
                     futures = {}
-                    for d in _DETAIL_DESTS:
+                    for d in other_dests:
                         curr = _DEST_CURRENCIES.get(d, DEFAULT_CURR)
                         futures[executor.submit(_fetch_region, nm_param, d, curr)] = d
                     for future in as_completed(futures):
@@ -684,11 +699,7 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
                         except Exception:
                             pass
 
-                if not region_results:
-                    progress.advance(task)
-                    continue
-
-                # Собираем продукты по регионам, запоминая dest каждого
+                # Собираем продукты по регионам
                 # all_instances[pid] = [(dest, product), ...]
                 all_instances = {}
                 for dest, prods in region_results.items():
@@ -698,16 +709,15 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
                             all_instances.setdefault(pid, []).append((dest, p))
 
                 # ── Объединяем stocks[] через Math.max ──
-                # Для цен всегда используем PRIMARY_DEST (BYN).
+                # Базовый продукт — всегда из PRIMARY_DEST (цены гарантированы)
                 for prod_id, instances in all_instances.items():
-                    # Выбираем базовый продукт из PRIMARY_DEST (цены в BYN)
                     prod = None
                     for dest, inst in instances:
                         if dest == _PRIMARY_DEST:
                             prod = inst
                             break
                     if not prod:
-                        prod = instances[0][1]  # fallback: любой регион
+                        continue  # без PRIMARY_DEST цены не гарантированы — пропускаем
 
                     # Собираем размеры → склады → макс. остаток из ВСЕХ регионов
                     merged_stocks = {}  # {size_name: {wh_id: max_qty}}

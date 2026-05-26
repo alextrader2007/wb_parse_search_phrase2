@@ -4,3 +4,6 @@ __pycache__/
 *.csv
 downloaded_files/
 111/
+build/
+*.spec
+*.png
