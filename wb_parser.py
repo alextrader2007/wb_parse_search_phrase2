@@ -33,7 +33,8 @@
 Известные ограничения:
   - totalQuantity: 39 — заглушка WB для «в наличии, точное количество скрыто».
     Парсер игнорирует эту заглушку и показывает только сумму stocks[].qty.
-  - Если Московский запрос (dest=-1257786) падает с 429, остатки могут быть 0.
+  - Цены всегда запрашиваются через PRIMARY_DEST (dest=-2888067, BYN).
+    Остальные регионы (RUB, KZT) используются только для stocks[].
 """
 
 import sys
@@ -45,6 +46,7 @@ import argparse
 import requests          # библиотека для отправки HTTP-запросов (основная работа с сетью)
 import pandas as pd      # библиотека для работы с таблицами (Excel/CSV)
 import msvcrt            # чтение клавиш (Enter/Esc) без ожидания Enter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from decimal import Decimal, ROUND_FLOOR  # точные математические расчёты (цены с WB-кошельком)
@@ -168,7 +170,6 @@ def get_basket_dynamically(vol: int, part: int, sku: int) -> str:
     if vol in _VOL_BASKET_CACHE:
         return _VOL_BASKET_CACHE[vol]
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     global _BASKET_EXECUTOR
     if _BASKET_EXECUTOR is None:
         _BASKET_EXECUTOR = ThreadPoolExecutor(max_workers=15)
@@ -331,14 +332,14 @@ def parse_single_product(product: Dict[str, Any],
         search_data: данные из поисковой выдачи (позиция, реклама, доставка)
 
     Returns:
-        словарь с полями: Артикул, Название, Бренд, Цена без скидки,
-        Цена со скидкой, Цена с WB кошельком, Рейтинг, Отзывы,
-        Остатки (всего), Склады детализация, Ссылка на товар, Ссылка на изображение
+        словарь с полями: Артикул, Бренд, Название, Цена без скидки,
+        Цена со скидкой, Цена с WB кошельком, Рейтинг, Отзывы (кол-во),
+        Остатки всего (шт), Детализация по складам, Ссылка на товар, Ссылка на фото
     """
     # ── Основные поля ──
     product_id = product.get('id')
     name = product.get('name', 'Неизвестно')
-    brand = product.get('brand', 'Нет бренда')
+    brand = product.get('brand') or 'Без бренда'
     supplier = product.get('supplier', 'Неизвестный продавец')
     supplier_id = product.get('supplierId')
     rating = product.get('rating', 0)
@@ -412,38 +413,45 @@ def parse_single_product(product: Dict[str, Any],
         basket = _VOL_BASKET_CACHE.get(vol) or _get_basket_static(vol)
         image_url = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{product_id}/images/big/1.webp"
 
-    # ── Сборка результата ──
+    # ── Данные из поисковой выдачи ──
+    position = ''
+    is_promo = 'Нет'
+    delivery_by = ''
+    if search_data:
+        position = search_data.get('position', '')
+        is_promo = search_data.get('is_promo', 'Нет')
+        t1_by = search_data.get('time1_by', '')
+        t2_by = search_data.get('time2_by', '')
+        if t1_by or t2_by:
+            delivery_by = f"{t1_by}-{t2_by} дн." if t1_by and t2_by else f"{t1_by or t2_by} дн."
+
+    # ── Время доставки по Москве ──
+    t1_msk = product.get('_time1_msk')
+    t2_msk = product.get('_time2_msk')
+    delivery_msk = ''
+    if t1_msk or t2_msk:
+        delivery_msk = f"{t1_msk}-{t2_msk} дн." if t1_msk and t2_msk else f"{t1_msk or t2_msk} дн."
+
     result = {
         'Артикул': product_id,
-        'Название': name,
         'Бренд': brand,
-        'Продавец': supplier,
-        'ID Продавца': supplier_id,
+        'Название': name,
         'Цена без скидки': price_original,
         'Цена со скидкой': price_discounted,
         'Цена с WB кошельком': calc_price_with_wallet(price_discounted),
         'Рейтинг': rating,
-        'Отзывы': feedbacks,
-        'Остатки (всего)': total_stock,
-        'Склады детализация': wh_summary_str,
+        'Отзывы (кол-во)': feedbacks,
+        'Остатки всего (шт)': total_stock,
+        'Детализация по складам': wh_summary_str,
+        'Продавец': supplier,
+        'ID Продавца': supplier_id,
+        'Позиция в выдаче': position,
+        'Реклама (Да/Нет)': is_promo,
+        'Срок доставки (Регион)': delivery_by,
+        'Срок доставки (МСК)': delivery_msk,
         'Ссылка на товар': f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
-        'Ссылка на изображение': image_url
+        'Ссылка на фото': image_url
     }
-
-    # ── Данные из поисковой выдачи (если есть) ──
-    if search_data:
-        result['Позиция в выдаче'] = search_data.get('position', '')
-        result['Реклама'] = search_data.get('is_promo', '')
-        t1_by = search_data.get('time1_by', '')
-        t2_by = search_data.get('time2_by', '')
-        if t1_by or t2_by:
-            result['Доставка (РБ)'] = f"{t1_by}-{t2_by} дн." if t1_by and t2_by else f"{t1_by or t2_by} дн."
-
-    # ── Время доставки по Москве (из второго запроса) ──
-    t1_msk = product.get('_time1_msk')
-    t2_msk = product.get('_time2_msk')
-    if t1_msk or t2_msk:
-        result['Доставка (МСК)'] = f"{t1_msk}-{t2_msk} дн." if t1_msk and t2_msk else f"{t1_msk or t2_msk} дн."
 
     return result
 
@@ -554,6 +562,42 @@ _DETAIL_MIRRORS = [
     "https://cards.wb.ru/cards/v5/detail",
 ]
 
+# Регионы для параллельного сбора остатков по складам.
+# Чем больше регионов — тем выше шанс получить полную картину stocks[].
+# (все dests взяты из анализа TS-парсера, покрывают все основные склады WB)
+_DETAIL_DESTS = [
+    "123585815",   # Москва / Центр
+    "123585590",   # СПб / Северо-Запад
+    "123585567",   # Сибирь / Новосибирск
+    "123585532",   # Юг / Краснодар
+    "123585474",   # Поволжье / Казань
+    "123585558",   # Вост. Сибирь / Кемерово
+    "-1257786",    # Москва (альт.)
+    "-1181704",    # Россия
+    "-1029256",    # Россия
+    "-1221148",    # Казахстан
+    "-2888067",    # Гродно, Беларусь — базовый для цен (BYN)
+]
+
+# Базовый регион — из него берём цены (должен поддерживать BYN)
+_PRIMARY_DEST = "-2888067"  # Гродно, Беларусь
+
+# Валюта для каждого региона (цены должны быть в правильной валюте,
+# иначе WB может вернуть priceU=0)
+_DEST_CURRENCIES = {
+    "123585815": "rub",
+    "123585590": "rub",
+    "123585567": "rub",
+    "123585532": "rub",
+    "123585474": "rub",
+    "123585558": "rub",
+    "-1257786": "rub",
+    "-1181704": "rub",
+    "-1029256": "rub",
+    "-1221148": "kzt",
+    "-2888067": "byn",
+}
+
 
 def _fetch_detail_batch(params: Dict[str, str], proxies: Optional[List[str]] = None, timeout: int = 15) -> Optional[Dict]:
     """
@@ -579,34 +623,34 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
 
     Как работает:
       1) Делит артикулы на батчи по 100 шт (ограничение API WB)
-      2) Для каждого батча делает ДВА запроса:
-         a) Grodno (BYN) — чтобы получить цены в BYN
-         b) Moscow (RUB) — чтобы получить остатки по ВСЕМ складам
-      3) Объединяет данные: цены из Grodno, остатки из Moscow
-      4) Парсит каждый товар через parse_single_product()
+      2) Для каждого батча делает параллельные запросы к нескольким регионам
+         (каждый — со своей валютой: RUB, BYN, KZT)
+      3) Цены берёт из PRIMARY_DEST (-2888067, BYN)
+      4) Stocks[] мерджит через Math.max из ВСЕХ регионов
+      5) Парсит каждый товар через parse_single_product()
 
-    Почему два запроса?
-      - WB для регионов Беларуси отдаёт только "ближайший склад" в stocks[]
-      - Для Москвы отдаёт все склады. Берём цены из BYN, остатки — из MOSCOW.
+    Зачем несколько регионов?
+      - WB для разных dest возвращает разные наборы складов в stocks[]
+      - Объединяя их через Math.max, получаем максимально полную картину
 
     Важно: totalQuantity: 39 — заглушка WB, парсер её игнорирует.
-           Если Московский запрос упал с 429, stocks[] остаются пустыми,
-           и total_stock = 0 (честно), а не 39 (ложь).
-
-    Args:
-        skus: список артикулов (int)
-        warehouse_map: словарь складов {ID: имя}
-        proxies: список прокси
-        search_meta: метаданные поиска {артикул: {position, is_promo, ...}}
-
-    Returns:
-        список словарей с информацией о товарах
     """
     parsed_products = []
 
     # API WB принимает максимум 100 артикулов за один запрос
     batch_size = 100
     batches = [skus[i:i + batch_size] for i in range(0, len(skus), batch_size)]
+
+    def _fetch_region(nm, dest, curr):
+        params = {
+            'appType': '1',
+            'curr': curr,
+            'dest': dest,
+            'spp': '30',
+            'nm': nm
+        }
+        data = _fetch_detail_batch(params, proxies=proxies, timeout=15)
+        return dest, (data or {}).get('products') or (data or {}).get('data', {}).get('products', [])
 
     with Progress(
         SpinnerColumn(),
@@ -621,65 +665,81 @@ def fetch_products_by_skus(skus: List[int], warehouse_map: Dict[int, str],
         for batch in batches:
             nm_param = ";".join(map(str, batch))
 
-            # ── Запрос 1: Grodno (BYN) → цены ──
-            params = {
-                'appType': '1',
-                'curr': DEFAULT_CURR,
-                'dest': DEFAULT_DEST,
-                'spp': '30',
-                'nm': nm_param
-            }
-
             try:
-                time.sleep(random.uniform(0.5, 1.5))  # пауза, чтобы не заблокировали
-                data = _fetch_detail_batch(params, proxies=proxies, timeout=15)
-                products_list = (data or {}).get('products') or (data or {}).get('data', {}).get('products', [])
+                time.sleep(random.uniform(0.5, 1.5))
 
-                # ── Запрос 2: Moscow (RUB) → остатки по складам ──
-                msk_prods_by_id = {}
-                try:
-                    time.sleep(random.uniform(1.0, 2.0))
-                    msk_params = {
-                        'appType': '1',
-                        'curr': 'rub',
-                        'dest': MOSCOW_DEST,
-                        'spp': '30',
-                        'nm': nm_param
-                    }
-                    msk_data = _fetch_detail_batch(msk_params, proxies=proxies, timeout=15)
-                    msk_products = (msk_data or {}).get('products') or (msk_data or {}).get('data', {}).get('products', [])
-                    for msk_prod in msk_products:
-                        pid = msk_prod.get('id')
-                        if pid:
-                            msk_prods_by_id[pid] = msk_prod
-                except Exception as msk_err:
-                    console.print(f"[yellow]Предупреждение: Московский запрос для складов не удался "
-                                   f"({msk_err}). Продолжаем без остатков.[/yellow]")
+                # ── Параллельные запросы ко всем регионам ──
+                region_results = {}  # dest -> products
+                with ThreadPoolExecutor(max_workers=len(_DETAIL_DESTS)) as executor:
+                    futures = {}
+                    for d in _DETAIL_DESTS:
+                        curr = _DEST_CURRENCIES.get(d, DEFAULT_CURR)
+                        futures[executor.submit(_fetch_region, nm_param, d, curr)] = d
+                    for future in as_completed(futures):
+                        d = futures[future]
+                        try:
+                            ret_dest, prods = future.result()
+                            if prods:
+                                region_results[ret_dest] = prods
+                        except Exception:
+                            pass
 
-                # ── Объединяем данные ──
-                for prod in products_list:
-                    prod_id = prod.get('id')
-                    if prod_id and prod_id in msk_prods_by_id:
-                        msk_prod = msk_prods_by_id[prod_id]
-                        msk_sizes = msk_prod.get('sizes', [])
-                        gro_sizes = prod.get('sizes', [])
-                        if msk_sizes:
-                            if gro_sizes:
-                                msk_stocks_by_name = {}
-                                for m_size in msk_sizes:
-                                    name = m_size.get('origName') or m_size.get('name')
-                                    if name:
-                                        msk_stocks_by_name[name] = m_size.get('stocks', [])
-                                for g_size in gro_sizes:
-                                    name = g_size.get('origName') or g_size.get('name')
-                                    if name in msk_stocks_by_name:
-                                        g_size['stocks'] = msk_stocks_by_name[name]
-                            else:
-                                prod['sizes'] = msk_sizes
-                        # Сохраняем время доставки по Москве
-                        if 'time1' in msk_prod or 'time2' in msk_prod:
-                            prod['_time1_msk'] = msk_prod.get('time1', '')
-                            prod['_time2_msk'] = msk_prod.get('time2', '')
+                if not region_results:
+                    progress.advance(task)
+                    continue
+
+                # Собираем продукты по регионам, запоминая dest каждого
+                # all_instances[pid] = [(dest, product), ...]
+                all_instances = {}
+                for dest, prods in region_results.items():
+                    for p in prods:
+                        pid = p.get('id')
+                        if pid is not None:
+                            all_instances.setdefault(pid, []).append((dest, p))
+
+                # ── Объединяем stocks[] через Math.max ──
+                # Для цен всегда используем PRIMARY_DEST (BYN).
+                for prod_id, instances in all_instances.items():
+                    # Выбираем базовый продукт из PRIMARY_DEST (цены в BYN)
+                    prod = None
+                    for dest, inst in instances:
+                        if dest == _PRIMARY_DEST:
+                            prod = inst
+                            break
+                    if not prod:
+                        prod = instances[0][1]  # fallback: любой регион
+
+                    # Собираем размеры → склады → макс. остаток из ВСЕХ регионов
+                    merged_stocks = {}  # {size_name: {wh_id: max_qty}}
+                    has_any_stock = False
+
+                    for dest, inst in instances:
+                        for sz in (inst.get('sizes') or []):
+                            sz_name = sz.get('origName') or sz.get('name') or 'No Size'
+                            if sz_name not in merged_stocks:
+                                merged_stocks[sz_name] = {}
+                            for st in (sz.get('stocks') or []):
+                                wh = st.get('wh')
+                                qty = st.get('qty', 0)
+                                if wh is not None:
+                                    prev = merged_stocks[sz_name].get(wh, 0)
+                                    merged_stocks[sz_name][wh] = prev if prev > qty else qty
+                                    if qty > 0:
+                                        has_any_stock = True
+
+                    # Применяем объединённые остатки к базовому продукту
+                    for sz in (prod.get('sizes') or []):
+                        sz_name = sz.get('origName') or sz.get('name') or 'No Size'
+                        if sz_name in merged_stocks:
+                            wh_qty_list = merged_stocks[sz_name]
+                            sz['stocks'] = [{'wh': wh, 'qty': qty} for wh, qty in wh_qty_list.items()]
+
+                    # Берём время доставки из любого инстанса, где оно есть
+                    for dest, inst in instances:
+                        if 'time1' in inst or 'time2' in inst:
+                            prod['_time1_msk'] = inst.get('time1', '')
+                            prod['_time2_msk'] = inst.get('time2', '')
+                            break
 
                     parsed_prod = parse_single_product(prod, warehouse_map,
                                                        search_meta.get(prod_id) if search_meta else None)
@@ -1074,7 +1134,7 @@ def display_results_in_table(products: List[Dict[str, Any]], limit: int = 10) ->
     for prod in products[:limit]:
         price_str = f"{prod.get('Цена без скидки', 0):.2f} / {prod.get('Цена со скидкой', 0):.2f} BYN"
         wallet_str = f"{prod.get('Цена с WB кошельком', 0):.2f} BYN"
-        rating_str = f"★{prod.get('Рейтинг', 0)} ({prod.get('Отзывы', 0)})"
+        rating_str = f"★{prod.get('Рейтинг', 0)} ({prod.get('Отзывы (кол-во)', 0)})"
         table.add_row(
             str(prod.get('Артикул', '')),
             str(prod.get('Бренд', '')),
@@ -1082,7 +1142,7 @@ def display_results_in_table(products: List[Dict[str, Any]], limit: int = 10) ->
             price_str,
             wallet_str,
             rating_str,
-            f"{prod.get('Остатки (всего)', 0)} шт",
+            f"{prod.get('Остатки всего (шт)', 0)} шт",
             str(prod.get('Продавец', ''))
         )
 
@@ -1215,8 +1275,6 @@ def fetch_all_details_parallel(products: List[Dict[str, Any]],
     Returns:
         словарь {артикул: {description, characteristics}}
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     details_map = {}
     with Progress(
         SpinnerColumn(),
@@ -1317,6 +1375,8 @@ def export_data(
                     rows.append({'Поле': 'Бренд', 'Значение': str(prod.get('Бренд', ''))})
                     rows.append({'Поле': 'Продавец', 'Значение': str(prod.get('Продавец', ''))})
                     rows.append({'Поле': 'Ссылка', 'Значение': str(prod.get('Ссылка на товар', ''))})
+                    rows.append({'Поле': 'Итого Складских запасов', 'Значение': f"{prod.get('Остатки всего (шт)', 0)} шт"})
+                    rows.append({'Поле': 'Детализация складов', 'Значение': str(prod.get('Детализация по складам', ''))})
                     rows.append({'Поле': '', 'Значение': ''})
                     rows.append({'Поле': 'ОПИСАНИЕ', 'Значение': details['description']})
                     rows.append({'Поле': '', 'Значение': ''})
@@ -1349,7 +1409,7 @@ def export_data(
                         basket = get_basket_dynamically(vol, part, nm_id)
                         image_url = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
                     else:
-                        image_url = prod.get('Ссылка на изображение')
+                        image_url = prod.get('Ссылка на фото')
 
                     if image_url:
                         try:
