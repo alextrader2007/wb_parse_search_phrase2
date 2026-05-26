@@ -26,7 +26,7 @@
   - Токен живёт ~неделю, кэшируется в переменной _WBAAS_TOKEN на время сеанса
 
 Особенности сборки .exe (PyInstaller):
-  - Драйвер Chrome сохраняется в %LOCALAPPDATA%\WBParser\drivers (не в temp)
+  - Драйвер Chrome сохраняется в %LOCALAPPDATA%\\WBParser\\drivers (не в temp)
   - Pillow включается через --collect-all PIL (нужен для вставки изображений в Excel)
   - После завершения программа ждёт Enter перед закрытием окна
 
@@ -44,6 +44,8 @@ import random
 import argparse
 import requests          # библиотека для отправки HTTP-запросов (основная работа с сетью)
 import pandas as pd      # библиотека для работы с таблицами (Excel/CSV)
+import msvcrt            # чтение клавиш (Enter/Esc) без ожидания Enter
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from decimal import Decimal, ROUND_FLOOR  # точные математические расчёты (цены с WB-кошельком)
 
@@ -1453,15 +1455,15 @@ def main():
     # ── Если режим не указан в аргументах — спрашиваем ──
     if not mode:
         console.rule("[bold yellow]Выбор режима работы[/bold yellow]")
-        console.print("[bold cyan]1[/bold cyan] — Сбор данных по артикулам (SKU)")
-        console.print("[bold cyan]2[/bold cyan] — Поиск товаров по ключевому слову")
+        console.print("[bold cyan]1[/bold cyan] — Поиск товаров по ключевому слову")
+        console.print("[bold cyan]2[/bold cyan] — Сбор данных по артикулам (SKU)")
         mode_choice = Prompt.ask(
             "Выберите режим (введите 1 или 2)",
             choices=["1", "2"],
             default="1",
             show_choices=False
         )
-        if mode_choice == "1":
+        if mode_choice == "2":
             mode = "sku"
             console.print("[cyan]Выбран режим: Сбор данных по артикулам (SKU)[/cyan]")
         else:
@@ -1518,7 +1520,7 @@ def main():
         # Фильтрация по ID продавца
         supplier_id = args.supplier_id
         if not supplier_id:
-            if Confirm.ask("Хотите сделать выборку по ID продавца (поставщика)?"):
+            if Confirm.ask("Хотите сделать выборку по ID продавца (поставщика)?", default=False):
                 supplier_id_str = Prompt.ask("Введите ID продавца (например, 682757)")
                 try:
                     supplier_id = int(supplier_id_str.strip())
@@ -1553,16 +1555,19 @@ def main():
 
         save_csv = Confirm.ask("Сохранить также CSV-файл?", default=False)
 
-        # Уточняем имя файла
+        # Авто-имя файла
+        today = datetime.now().strftime("%d%m%Y")
+        default_name = f"Rezalt_{today}" if include_details else f"RezaltAll_{today}"
         output_name = args.output
         if not args.output or args.output == "wb_results":
             output_name = Prompt.ask(
                 "Введите имя файла для сохранения результатов",
-                default="wb_results"
+                default=default_name
             )
 
         export_data(products_data, output_name, include_details=include_details, proxies=proxies, save_csv=save_csv)
 
+        csv_msg = f"\n - [cyan]{output_name}.csv[/cyan] (формат CSV UTF-8)" if save_csv else ""
         extra_sheets_msg = (
             f"\n - [cyan]{output_name}.xlsx[/cyan] содержит листы 1–{len(products_data)} "
             f"с характеристиками" if include_details else ""
@@ -1570,8 +1575,7 @@ def main():
         console.print(Panel(
             "[bold green]Парсинг успешно завершен![/bold green]\n"
             f"Созданы файлы:\n"
-            f" - [cyan]{output_name}.xlsx[/cyan] (лист 'Товары' — основные данные){extra_sheets_msg}\n"
-            f" - [cyan]{output_name}.csv[/cyan] (формат CSV UTF-8)\n"
+            f" - [cyan]{output_name}.xlsx[/cyan] (лист 'Товары' — основные данные){extra_sheets_msg}{csv_msg}\n"
             "Вы можете открыть их для дальнейшего анализа.",
             title="Результат",
             border_style="green"
@@ -1586,9 +1590,13 @@ def main():
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Работа парсера прервана пользователем.[/yellow]")
-    finally:
-        input("\nНажмите Enter для выхода...")
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Работа парсера прервана пользователем.[/yellow]")
+        console.print("\nНажмите Enter для продолжения работы или Esc для выхода из программы")
+        key = msvcrt.getch()
+        if key == b'\x1b':  # Esc
+            break
+        # Enter (b'\r') — продолжаем цикл
