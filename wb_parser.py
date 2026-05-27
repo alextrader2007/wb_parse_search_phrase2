@@ -1440,9 +1440,11 @@ def export_data(
                     desc_label_row = last_content_row + 2  # blank row gap
                     if desc:
                         ws.cell(row=desc_label_row, column=3, value='ОПИСАНИЕ').font = bold_font
+                        ws.cell(row=desc_label_row, column=3).alignment = Alignment(vertical='top')
                         ws.cell(row=desc_label_row, column=4, value=desc).font = normal_font
                         ws.cell(row=desc_label_row, column=4).alignment = Alignment(
                             horizontal='left', vertical='top', wrap_text=True)
+                        ws.row_dimensions[desc_label_row].height = 300
 
                     # ── Ширина колонок (как в шаблоне) ──
                     ws.column_dimensions['A'].width = 12
@@ -1477,8 +1479,7 @@ def export_data(
                                     img.height = max_height
                                     img.width = int(img.width * ratio)
 
-                                photo_row = desc_label_row + 1 if desc else desc_label_row
-                                ws.add_image(img, f'A{photo_row}')
+                                ws.add_image(img, 'A1')
                         except Exception:
                             pass
 
