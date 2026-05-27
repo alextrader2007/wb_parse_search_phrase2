@@ -49,6 +49,7 @@ import msvcrt            # чтение клавиш (Enter/Esc) без ожид
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from openpyxl.styles import Font, Alignment
 from decimal import Decimal, ROUND_FLOOR  # точные математические расчёты (цены с WB-кошельком)
 
 # ---------------------------------------------------------------------------
@@ -1388,10 +1389,16 @@ def export_data(
                     # Создаём лист через openpyxl (шаблон: Поле+Значение слева,
                     # характеристики справа)
                     ws = wb.create_sheet(title=sheet_name)
+                    bold_font = Font(name='Calibri', size=11, bold=True)
+                    normal_font = Font(name='Calibri', size=11, bold=False)
 
-                    # ── Row 1: заголовки левой панели ──
+                    # ── Row 1: заголовки левой панели (центр, bold) ──
                     ws['C1'] = 'Поле'
                     ws['D1'] = 'Значение'
+                    ws['C1'].font = bold_font
+                    ws['D1'].font = bold_font
+                    ws['C1'].alignment = Alignment(horizontal='center', vertical='top')
+                    ws['D1'].alignment = Alignment(horizontal='center', vertical='top')
 
                     # ── Left panel: основные поля товара (колонки C-D) ──
                     info_rows = [
@@ -1407,39 +1414,43 @@ def export_data(
                     # ── Right panel: характеристики рядом с левой панелью ──
                     # row 2 = шапка "--- ХАРАКТЕРИСТИКИ ---", row 3+ = значения
                     if chars:
-                        ws.cell(row=2, column=6, value='--- ХАРАКТЕРИСТИКИ ---')
+                        cell = ws.cell(row=2, column=6, value='--- ХАРАКТЕРИСТИКИ ---')
                     else:
-                        ws.cell(row=2, column=6, value='Характеристики')
-                        ws.cell(row=2, column=7, value='Не найдены')
+                        ws.cell(row=2, column=6, value='Характеристики').font = bold_font
+                        ws.cell(row=2, column=7, value='Не найдены').font = normal_font
 
                     for i, (field, value) in enumerate(info_rows):
                         row = i + 2
-                        ws.cell(row=row, column=3, value=field)
-                        ws.cell(row=row, column=4, value=value)
+                        ws.cell(row=row, column=3, value=field).font = bold_font
+                        ws.cell(row=row, column=4, value=value).font = normal_font
                         char_idx = i - 1  # row 2 = заголовок, chars[0] = row 3
                         if 0 <= char_idx < len(chars):
-                            ws.cell(row=row, column=6, value=chars[char_idx].get('Характеристика', ''))
-                            ws.cell(row=row, column=7, value=chars[char_idx].get('Значение', ''))
+                            ws.cell(row=row, column=6, value=chars[char_idx].get('Характеристика', '')).font = bold_font
+                            ws.cell(row=row, column=7, value=chars[char_idx].get('Значение', '')).font = normal_font
 
                     # Оставшиеся характеристики (после 6, которые влезли рядом)
                     if chars and len(chars) > len(info_rows) - 1:
                         for ci in range(len(info_rows) - 1, len(chars)):
                             row = ci + 3
-                            ws.cell(row=row, column=6, value=chars[ci].get('Характеристика', ''))
-                            ws.cell(row=row, column=7, value=chars[ci].get('Значение', ''))
+                            ws.cell(row=row, column=6, value=chars[ci].get('Характеристика', '')).font = bold_font
+                            ws.cell(row=row, column=7, value=chars[ci].get('Значение', '')).font = normal_font
 
                     # ── Описание внизу (после пустой строки) ──
                     last_content_row = max(len(info_rows) + 1, len(chars) + 2)
                     desc_label_row = last_content_row + 2  # blank row gap
                     if desc:
-                        ws.cell(row=desc_label_row, column=3, value='ОПИСАНИЕ')
-                        ws.cell(row=desc_label_row, column=4, value=desc)
+                        ws.cell(row=desc_label_row, column=3, value='ОПИСАНИЕ').font = bold_font
+                        ws.cell(row=desc_label_row, column=4, value=desc).font = normal_font
+                        ws.cell(row=desc_label_row, column=4).alignment = Alignment(
+                            horizontal='left', vertical='top', wrap_text=True)
 
-                    # ── Ширина колонок ──
-                    ws.column_dimensions['C'].width = 25
-                    ws.column_dimensions['D'].width = 60
-                    ws.column_dimensions['F'].width = 25
-                    ws.column_dimensions['G'].width = 50
+                    # ── Ширина колонок (как в шаблоне) ──
+                    ws.column_dimensions['A'].width = 12
+                    ws.column_dimensions['B'].width = 37.7
+                    ws.column_dimensions['C'].width = 25.29
+                    ws.column_dimensions['D'].width = 98
+                    ws.column_dimensions['F'].width = 28.86
+                    ws.column_dimensions['G'].width = 46.14
 
                     # ── Фото товара ──
                     if nm_id:
