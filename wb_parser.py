@@ -1372,47 +1372,76 @@ def export_data(
                 ws.column_dimensions[col_letter].width = min(max_len + 3, 60)
 
             if include_details:
+                wb = writer.book
+                # Удаляем пустой лист по умолчанию (openpyxl создаёт 'Sheet')
+                if 'Sheet' in wb.sheetnames:
+                    del wb['Sheet']
+
                 for idx, prod in enumerate(products, start=1):
                     nm_id = prod.get('Артикул')
                     sheet_name = str(idx)
 
                     details = details_map.get(nm_id, {'description': '', 'characteristics': []})
+                    chars = details.get('characteristics', [])
+                    desc = details.get('description', '')
 
-                    # Формируем содержимое листа
-                    rows = []
-                    rows.append({'Поле': 'Артикул', 'Значение': str(nm_id or '')})
-                    rows.append({'Поле': 'Название', 'Значение': str(prod.get('Название', ''))})
-                    rows.append({'Поле': 'Бренд', 'Значение': str(prod.get('Бренд', ''))})
-                    rows.append({'Поле': 'Продавец', 'Значение': str(prod.get('Продавец', ''))})
-                    rows.append({'Поле': 'Ссылка', 'Значение': str(prod.get('Ссылка на товар', ''))})
-                    rows.append({'Поле': 'Итого Складских запасов', 'Значение': f"{prod.get('Остатки всего (шт)', 0)} шт"})
-                    rows.append({'Поле': 'Детализация складов', 'Значение': str(prod.get('Детализация по складам', ''))})
-                    rows.append({'Поле': '', 'Значение': ''})
-                    rows.append({'Поле': 'ОПИСАНИЕ', 'Значение': details['description']})
-                    rows.append({'Поле': '', 'Значение': ''})
+                    # Создаём лист через openpyxl (шаблон: Поле+Значение слева,
+                    # характеристики справа)
+                    ws = wb.create_sheet(title=sheet_name)
 
-                    if details['characteristics']:
-                        rows.append({'Поле': '--- ХАРАКТЕРИСТИКИ ---', 'Значение': ''})
-                        for char in details['characteristics']:
-                            rows.append({
-                                'Поле': char.get('Характеристика', ''),
-                                'Значение': char.get('Значение', '')
-                            })
+                    # ── Row 1: заголовки левой панели ──
+                    ws['C1'] = 'Поле'
+                    ws['D1'] = 'Значение'
+
+                    # ── Left panel: основные поля товара (колонки C-D) ──
+                    info_rows = [
+                        ('Артикул', str(nm_id or '')),
+                        ('Название', str(prod.get('Название', ''))),
+                        ('Бренд', str(prod.get('Бренд', ''))),
+                        ('Продавец', str(prod.get('Продавец', ''))),
+                        ('Ссылка', str(prod.get('Ссылка на товар', ''))),
+                        ('Итого Складских запасов', f"{prod.get('Остатки всего (шт)', 0)} шт"),
+                        ('Детализация складов', str(prod.get('Детализация по складам', ''))),
+                    ]
+
+                    # ── Right panel: характеристики рядом с левой панелью ──
+                    # row 2 = шапка "--- ХАРАКТЕРИСТИКИ ---", row 3+ = значения
+                    if chars:
+                        ws.cell(row=2, column=6, value='--- ХАРАКТЕРИСТИКИ ---')
                     else:
-                        rows.append({'Поле': 'Характеристики', 'Значение': 'Не найдены'})
+                        ws.cell(row=2, column=6, value='Характеристики')
+                        ws.cell(row=2, column=7, value='Не найдены')
 
-                    sheet_df = pd.DataFrame(rows)
-                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    detail_ws = writer.sheets[sheet_name]
-                    for col_cells in detail_ws.columns:
-                        max_len = 0
-                        col_letter = col_cells[0].column_letter
-                        for cell in col_cells:
-                            val = str(cell.value or '')
-                            max_len = max(max_len, len(val))
-                        detail_ws.column_dimensions[col_letter].width = min(max_len + 3, 80)
+                    for i, (field, value) in enumerate(info_rows):
+                        row = i + 2
+                        ws.cell(row=row, column=3, value=field)
+                        ws.cell(row=row, column=4, value=value)
+                        char_idx = i - 1  # row 2 = заголовок, chars[0] = row 3
+                        if 0 <= char_idx < len(chars):
+                            ws.cell(row=row, column=6, value=chars[char_idx].get('Характеристика', ''))
+                            ws.cell(row=row, column=7, value=chars[char_idx].get('Значение', ''))
 
-                    # Вставляем фото товара (если удалось загрузить)
+                    # Оставшиеся характеристики (после 6, которые влезли рядом)
+                    if chars and len(chars) > len(info_rows) - 1:
+                        for ci in range(len(info_rows) - 1, len(chars)):
+                            row = ci + 3
+                            ws.cell(row=row, column=6, value=chars[ci].get('Характеристика', ''))
+                            ws.cell(row=row, column=7, value=chars[ci].get('Значение', ''))
+
+                    # ── Описание внизу (после пустой строки) ──
+                    last_content_row = max(len(info_rows) + 1, len(chars) + 2)
+                    desc_label_row = last_content_row + 2  # blank row gap
+                    if desc:
+                        ws.cell(row=desc_label_row, column=3, value='ОПИСАНИЕ')
+                        ws.cell(row=desc_label_row, column=4, value=desc)
+
+                    # ── Ширина колонок ──
+                    ws.column_dimensions['C'].width = 25
+                    ws.column_dimensions['D'].width = 60
+                    ws.column_dimensions['F'].width = 25
+                    ws.column_dimensions['G'].width = 50
+
+                    # ── Фото товара ──
                     if nm_id:
                         vol = nm_id // 100000
                         part = nm_id // 1000
@@ -1431,17 +1460,15 @@ def export_data(
                                 img_data = io.BytesIO(img_resp.content)
                                 img = OpenpyxlImage(img_data)
 
-                                # Масштабируем изображение (максимальная высота 300px)
                                 max_height = 300
                                 if img.height > max_height:
                                     ratio = max_height / img.height
                                     img.height = max_height
                                     img.width = int(img.width * ratio)
 
-                                ws = writer.sheets[sheet_name]
-                                insert_row = len(rows) + 3
-                                ws.add_image(img, f'A{insert_row}')
-                        except Exception as img_err:
+                                photo_row = desc_label_row + 1 if desc else desc_label_row
+                                ws.add_image(img, f'A{photo_row}')
+                        except Exception:
                             pass
 
         console.print(f"[green]✔ Данные успешно экспортированы в Excel: {excel_file}[/green]")
